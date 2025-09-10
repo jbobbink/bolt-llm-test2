@@ -2,11 +2,14 @@ import React, { useState, useCallback, useEffect } from 'react';
 import { SetupForm } from './components/SetupForm';
 import { ResultsDashboard } from './components/ResultsDashboard';
 import { runAnalysis } from './services/geminiService';
-import type { AnalysisResult, AppConfig, SavedReport, Task } from './types';
+import type { AnalysisResult, AppConfig, SavedReport, Task, Session, ApiKeys } from './types';
 import { LoadingStatus } from './components/LoadingSpinner';
 import { SavedReportsList } from './components/SavedReportsList';
 import { ReportViewer } from './components/ReportViewer';
 import { generateHtmlReport, createHostedReport } from './utils/exportUtils';
+import { supabase } from './supabase';
+import { Auth } from './components/Auth';
+import { Settings } from './components/Settings';
 
 const TravykLogo: React.FC = () => (
     <svg aria-label="TRAVYK Logo" height="28" viewBox="0 0 180 32" xmlns="http://www.w3.org/2000/svg">
@@ -103,6 +106,11 @@ const ShareLinkModal: React.FC<ShareLinkModalProps> = ({ sharingState, onClose }
 
 
 const App: React.FC = () => {
+  const [session, setSession] = useState<Session | null>(null);
+  const [view, setView] = useState<'app' | 'settings'>('app');
+  const [apiKeys, setApiKeys] = useState<ApiKeys>({});
+  const [keysLoaded, setKeysLoaded] = useState(false);
+
   const [appConfig, setAppConfig] = useState<AppConfig | null>(null);
   const [results, setResults] = useState<AnalysisResult[] | null>(null);
   const [isLoading, setIsLoading] = useState<boolean>(false);
@@ -114,29 +122,67 @@ const App: React.FC = () => {
   const [sharingReport, setSharingReport] = useState<{ reportId: string, isSharing: boolean, link: string | null, error: string | null } | null>(null);
 
   useEffect(() => {
-    try {
-      const storedReports = localStorage.getItem('llm_visibility_reports');
-      if (storedReports) {
-        setSavedReports(JSON.parse(storedReports));
-      }
-    } catch (e) {
-      console.error("Failed to load saved reports:", e);
-      localStorage.removeItem('llm_visibility_reports');
-    }
+    supabase.auth.getSession().then(({ data: { session } }) => {
+      setSession(session);
+    });
+
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
+      setSession(session);
+    });
+
+    return () => subscription.unsubscribe();
   }, []);
+
+  // Data fetching for logged-in user
+  useEffect(() => {
+    if (session) {
+      setKeysLoaded(false);
+      supabase.from('profiles').select('gemini, openai, perplexity, copilotKey, copilotEndpoint').eq('id', session.user.id).single()
+        .then(({ data, error }) => {
+          if (data) {
+            setApiKeys({
+              gemini: data.gemini,
+              openai: data.openai,
+              perplexity: data.perplexity,
+              copilotKey: data.copilotKey,
+              copilotEndpoint: data.copilotEndpoint,
+            });
+          } else if (error && error.code !== 'PGRST116') { // Ignore 'exact one row' error for new users
+            console.error("Error fetching API keys:", error);
+          }
+          setKeysLoaded(true);
+        });
+
+      supabase.from('reports').select('id, created_at, clientName, htmlContent, shareableLink').eq('user_id', session.user.id).order('created_at', { ascending: false })
+        .then(({ data, error }) => {
+          if (error) {
+            console.error("Error fetching reports:", error);
+            setError("Could not load your saved reports.");
+          } else if (data) {
+            const reports = data.map(r => ({ ...r, createdAt: r.created_at }));
+            setSavedReports(reports);
+          }
+        });
+    } else {
+      setSavedReports([]);
+      setApiKeys({});
+      setKeysLoaded(false);
+    }
+  }, [session]);
 
   const handleProgressUpdate = useCallback((updatedTasks: Task[]) => {
     setTasks(updatedTasks);
   }, []);
 
-  const handleStartAnalysis = useCallback(async (config: AppConfig) => {
+  const handleStartAnalysis = useCallback(async (config: Omit<AppConfig, 'apiKeys'>) => {
     setIsLoading(true);
     setError(null);
     setResults(null);
-    setAppConfig(config);
+    const fullConfig: AppConfig = { ...config, apiKeys };
+    setAppConfig(fullConfig);
     setTasks([]);
     try {
-      const analysisResults = await runAnalysis(config, handleProgressUpdate);
+      const analysisResults = await runAnalysis(fullConfig, handleProgressUpdate);
       setResults(analysisResults);
     } catch (e) {
       console.error(e);
@@ -144,7 +190,7 @@ const App: React.FC = () => {
     } finally {
       setIsLoading(false);
     }
-  }, [handleProgressUpdate]);
+  }, [apiKeys, handleProgressUpdate]);
 
   const handleReset = () => {
     setAppConfig(null);
@@ -153,24 +199,29 @@ const App: React.FC = () => {
     setError(null);
     setTasks([]);
     setViewingReportHtml(null);
+    setView('app');
   };
   
-  const handleSaveReport = useCallback(() => {
-    if (!results || !appConfig) return;
+  const handleSaveReport = useCallback(async () => {
+    if (!results || !appConfig || !session) return;
 
     const htmlContent = generateHtmlReport(results, appConfig);
-    const newReport: SavedReport = {
-        id: `report-${Date.now()}`,
-        createdAt: new Date().toISOString(),
+    const newReportData = {
+        user_id: session.user.id,
         clientName: appConfig.clientName,
         htmlContent: htmlContent,
     };
+    
+    const { data, error } = await supabase.from('reports').insert(newReportData).select('id, created_at, clientName, htmlContent, shareableLink').single();
 
-    const updatedReports = [...savedReports, newReport];
-    setSavedReports(updatedReports);
-    localStorage.setItem('llm_visibility_reports', JSON.stringify(updatedReports));
-    alert('Report saved successfully!');
-  }, [results, appConfig, savedReports]);
+    if (error) {
+        alert(`Error saving report: ${error.message}`);
+    } else if (data) {
+        const newReport: SavedReport = { ...data, createdAt: data.created_at };
+        setSavedReports(prev => [newReport, ...prev]);
+        alert('Report saved successfully!');
+    }
+  }, [results, appConfig, session]);
 
   const handleShareSavedReport = useCallback(async (reportId: string) => {
     const reportToShare = savedReports.find(r => r.id === reportId);
@@ -184,11 +235,14 @@ const App: React.FC = () => {
     setSharingReport({ reportId, isSharing: true, link: null, error: null });
     try {
         const newLink = await createHostedReport(reportToShare.htmlContent, reportToShare.clientName);
+        
+        const { error } = await supabase.from('reports').update({ shareableLink: newLink }).eq('id', reportId);
+        if (error) throw error;
+        
         const updatedReports = savedReports.map(r =>
             r.id === reportId ? { ...r, shareableLink: newLink } : r
         );
         setSavedReports(updatedReports);
-        localStorage.setItem('llm_visibility_reports', JSON.stringify(updatedReports));
         setSharingReport({ reportId, isSharing: false, link: newLink, error: null });
     } catch (e) {
         const errorMsg = e instanceof Error ? e.message : 'An unknown error occurred.';
@@ -196,19 +250,32 @@ const App: React.FC = () => {
     }
   }, [savedReports]);
 
-  const handleDeleteReport = useCallback((reportId: string) => {
+  const handleDeleteReport = useCallback(async (reportId: string) => {
     if (confirm('Are you sure you want to delete this report? This action cannot be undone.')) {
-        const updatedReports = savedReports.filter(report => report.id !== reportId);
-        setSavedReports(updatedReports);
-        localStorage.setItem('llm_visibility_reports', JSON.stringify(updatedReports));
+        const { error } = await supabase.from('reports').delete().eq('id', reportId);
+        if (error) {
+            alert(`Error deleting report: ${error.message}`);
+        } else {
+            setSavedReports(prev => prev.filter(report => report.id !== reportId));
+        }
     }
-  }, [savedReports]);
+  }, []);
 
   const handleViewReport = (htmlContent: string) => {
     setViewingReportHtml(htmlContent);
   };
+  
+  const handleLogout = async () => {
+      handleReset();
+      await supabase.auth.signOut();
+  }
+  
+  const apiKeysConfigured = keysLoaded && Object.values(apiKeys).some(key => key && String(key).trim() !== '');
 
   const mainContent = () => {
+    if (session && view === 'settings') {
+        return <Settings user={session.user} onClose={() => { setView('app'); }} />;
+    }
     if (viewingReportHtml) {
       return <ReportViewer htmlContent={viewingReportHtml} onClose={handleReset} />;
     }
@@ -228,7 +295,7 @@ const App: React.FC = () => {
     }
     return (
       <div className="space-y-12">
-        <SetupForm onStartAnalysis={handleStartAnalysis} />
+        <SetupForm onStartAnalysis={handleStartAnalysis} apiKeysConfigured={apiKeysConfigured} />
         <SavedReportsList 
             reports={savedReports} 
             onView={handleViewReport} 
@@ -239,13 +306,21 @@ const App: React.FC = () => {
       </div>
     );
   }
+  
+  if (!session) {
+      return <Auth />;
+  }
 
   return (
     <div className="min-h-screen bg-gray-900 text-gray-100 font-sans">
       <header className="bg-gray-800/50 backdrop-blur-sm border-b border-gray-700 p-4 sticky top-0 z-10">
         <div className="container mx-auto flex justify-between items-center">
           <TravykLogo />
-           {(results || viewingReportHtml) && <button onClick={handleReset} className="bg-green-600 hover:bg-green-700 text-white font-bold py-2 px-4 rounded-lg transition-colors">Start New Analysis</button>}
+           <div className="flex items-center space-x-4">
+             {(results || viewingReportHtml || view === 'settings') && <button onClick={handleReset} className="bg-green-600 hover:bg-green-700 text-white font-bold py-2 px-4 rounded-lg transition-colors">Start New Analysis</button>}
+             {view === 'app' && (!results && !viewingReportHtml) && <button onClick={() => setView('settings')} className="bg-gray-600 hover:bg-gray-700 text-white font-bold py-2 px-4 rounded-lg transition-colors">Settings</button>}
+             <button onClick={handleLogout} className="bg-gray-600 hover:bg-gray-700 text-white font-bold py-2 px-4 rounded-lg transition-colors">Logout</button>
+           </div>
         </div>
       </header>
       

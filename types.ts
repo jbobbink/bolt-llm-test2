@@ -1,4 +1,7 @@
 import type { GoogleGenAI } from "@google/genai";
+import type { Session, User } from '@supabase/supabase-js';
+
+export type { Session, User };
 
 export type Provider = 'gemini' | 'openai' | 'perplexity' | 'copilot';
 
@@ -58,11 +61,12 @@ export interface LlmClients {
 }
 
 export interface SavedReport {
-  id: string;
-  createdAt: string;
+  id: string; // This will be a UUID from Supabase
+  createdAt: string; // Mapped from 'created_at'
   clientName: string;
   htmlContent: string;
   shareableLink?: string;
+  user_id?: string;
 }
 
 export interface Task {
